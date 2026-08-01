@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import shutil
 import subprocess
 import sys
 import threading
+import sqlite3
+import tempfile
 import time
 import tkinter as tk
 import webbrowser
@@ -39,6 +42,7 @@ class DownloadSettings:
     restrict_names: bool
     browser: str
     concurrent_fragments: int
+    cookiefile: str | None
 
 
 class GuiLogger:
@@ -60,13 +64,13 @@ class GuiLogger:
 
 class YtDlpGui(tk.Tk):
     QUALITY_MAP = {
-        "Melhor disponível": "bestvideo*+bestaudio/best",
-        "Até 2160p (4K)": "bestvideo*[height<=2160]+bestaudio/best[height<=2160]/best",
-        "Até 1440p": "bestvideo*[height<=1440]+bestaudio/best[height<=1440]/best",
-        "Até 1080p": "bestvideo*[height<=1080]+bestaudio/best[height<=1080]/best",
-        "Até 720p": "bestvideo*[height<=720]+bestaudio/best[height<=720]/best",
-        "Até 480p": "bestvideo*[height<=480]+bestaudio/best[height<=480]/best",
-        "Até 360p": "bestvideo*[height<=360]+bestaudio/best[height<=360]/best",
+        "Melhor disponível": "bestvideo+bestaudio/best",
+        "Até 2160p (4K)": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+        "Até 1440p": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
+        "Até 1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "Até 720p": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "Até 480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+        "Até 360p": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
     }
 
     BROWSERS = {
@@ -98,6 +102,8 @@ class YtDlpGui(tk.Tk):
         self._create_variables()
         self._build_ui()
         self._update_media_controls()
+        # Start periodic FFmpeg availability checks
+        self.after(1000, self._update_ffmpeg_status)
         self.after(100, self._process_events)
 
         if yt_dlp is None:
@@ -135,6 +141,11 @@ class YtDlpGui(tk.Tk):
         self.speed_var = tk.StringVar(value="")
         self.eta_var = tk.StringVar(value="")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.cookiefile_var = tk.StringVar(value="")
+        # temporary cookiefile created when copying browser DB
+        self._temp_cookiefile: str | None = None
+        # Flag to avoid overlapping FFmpeg checks
+        self.ffmpeg_check_running = False
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self, padding=18)
@@ -217,6 +228,13 @@ class YtDlpGui(tk.Tk):
             width=18,
         ).grid(row=1, column=3, sticky="ew")
 
+        # Cookie file selector
+        ttk.Label(settings, text="Arquivo de cookies opcional:").grid(row=2, column=3, sticky="w", pady=(8,0))
+        cookie_frame = ttk.Frame(settings)
+        cookie_frame.grid(row=3, column=3, sticky="ew")
+        ttk.Entry(cookie_frame, textvariable=self.cookiefile_var, width=22).pack(side="left", fill="x", expand=True)
+        ttk.Button(cookie_frame, text="Selecionar", command=self.choose_cookie_file).pack(side="left", padx=(6,0))
+
         options = ttk.Frame(settings)
         options.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(13, 0))
         for column in range(4):
@@ -248,6 +266,13 @@ class YtDlpGui(tk.Tk):
             textvariable=self.fragments_var,
             width=5,
         ).pack(side="left", padx=(6, 0))
+
+        # FFmpeg status indicator (will be updated periodically)
+        ffmpeg_frame = ttk.Frame(settings)
+        ffmpeg_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Label(ffmpeg_frame, text="FFmpeg:").pack(side="left", padx=(0, 6))
+        self.ffmpeg_status_label = tk.Label(ffmpeg_frame, text="Verificando...", bg="gray", fg="white", padx=8)
+        self.ffmpeg_status_label.pack(side="left")
 
         controls = ttk.Frame(main)
         controls.grid(row=3, column=0, sticky="ew", pady=(0, 10))
@@ -355,6 +380,146 @@ class YtDlpGui(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Erro", f"Não foi possível abrir a pasta:\n{exc}")
 
+    def choose_cookie_file(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Selecione o arquivo SQLite de cookies (ex.: Cookies)",
+            filetypes=(("SQLite files", "*.sqlite;*.db;*"), ("All files", "*.*")),
+            initialdir=str(Path.home()),
+        )
+        if selected:
+            self.cookiefile_var.set(selected)
+
+    def _find_chrome_like_cookie_file(self, browser: str) -> str | None:
+        # Search common locations for Chrome/Edge-like cookie DBs
+        local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if not local:
+            return None
+        candidates = []
+        # Map browser key to base folder names
+        mapping = {
+            "chrome": os.path.join(local, "Google", "Chrome", "User Data"),
+            "edge": os.path.join(local, "Microsoft", "Edge", "User Data"),
+            "chromium": os.path.join(local, "Chromium", "User Data"),
+            "brave": os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data"),
+            "vivaldi": os.path.join(local, "Vivaldi", "User Data"),
+        }
+        base = mapping.get(browser)
+        if base and os.path.isdir(base):
+            # check Default and common profiles
+            for profile in ("Default", "Profile 1", "Profile 2"):
+                p = os.path.join(base, profile, "Cookies")
+                if os.path.isfile(p):
+                    candidates.append(p)
+            # also check any directory under base
+            try:
+                for name in os.listdir(base):
+                    p = os.path.join(base, name, "Cookies")
+                    if os.path.isfile(p):
+                        candidates.append(p)
+            except Exception:
+                pass
+
+        return candidates[0] if candidates else None
+
+    def _copy_sqlite_db_with_backup(self, src: str) -> str | None:
+        # Try to create a consistent copy using sqlite3 backup API; fallback to shutil.copy2
+        try:
+            if not os.path.isfile(src):
+                return None
+            dest = tempfile.NamedTemporaryFile(prefix="yt_dlp_cookies_", delete=False).name
+            try:
+                # open destination DB
+                dest_conn = sqlite3.connect(dest)
+                try:
+                    # try to open src in read-only URI mode
+                    src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+                except sqlite3.OperationalError:
+                    dest_conn.close()
+                    # fallback to raw copy
+                    shutil.copy2(src, dest)
+                    return dest
+                try:
+                    with src_conn:
+                        src_conn.backup(dest_conn)
+                    return dest
+                finally:
+                    try:
+                        src_conn.close()
+                    except Exception:
+                        pass
+                    try:
+                        dest_conn.close()
+                    except Exception:
+                        pass
+            except Exception:
+                # fallback to copy
+                try:
+                    shutil.copy2(src, dest)
+                    return dest
+                except Exception:
+                    try:
+                        if os.path.exists(dest):
+                            os.remove(dest)
+                    except Exception:
+                        pass
+                    return None
+        except Exception:
+            return None
+
+    def _on_detect_cookies(self) -> None:
+        # Run detection in background to avoid UI freeze
+        def _job():
+            path = self._find_opera_cookie_file()
+            if path:
+                try:
+                    self.after(0, lambda: self.cookiefile_var.set(path))
+                    self.event_queue.put(("log", f"Detectado cookie do Opera: {path}"))
+                except Exception:
+                    pass
+            else:
+                self.event_queue.put(("log", "Não foi possível detectar automaticamente o arquivo de cookies do Opera."))
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _find_opera_cookie_file(self) -> str | None:
+        # Common Opera profile locations to check
+        candidates: list[str] = []
+        appdata = os.environ.get("APPDATA")
+        localappdata = os.environ.get("LOCALAPPDATA")
+        def check_base(base: str) -> None:
+            try:
+                if not base or not os.path.isdir(base):
+                    return
+                for name in os.listdir(base):
+                    possible = os.path.join(base, name, "Cookies")
+                    if os.path.isfile(possible):
+                        candidates.append(possible)
+            except Exception:
+                pass
+
+        # Typical Opera roaming profile
+        if appdata:
+            check_base(os.path.join(appdata, "Opera Software"))
+        # Also check LOCALAPPDATA
+        if localappdata:
+            check_base(os.path.join(localappdata, "Opera Software"))
+
+        # As a fallback, search a few known subpaths
+        known_paths = [
+            os.path.join(appdata or "", "Opera Software", "Opera Stable", "Cookies"),
+            os.path.join(appdata or "", "Opera Software", "Opera GX Stable", "Cookies"),
+            os.path.join(appdata or "", "Opera Software", "Opera Air Stable", "Cookies"),
+            # also check localappdata variants
+            os.path.join(localappdata or "", "Opera Software", "Opera Stable", "Cookies"),
+            os.path.join(localappdata or "", "Opera Software", "Opera GX Stable", "Cookies"),
+            os.path.join(localappdata or "", "Opera Software", "Opera Air Stable", "Cookies"),
+        ]
+        for p in known_paths:
+            if p and os.path.isfile(p):
+                candidates.insert(0, p)
+
+        return candidates[0] if candidates else None
+
     def clear_log(self) -> None:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
@@ -400,6 +565,7 @@ class YtDlpGui(tk.Tk):
             restrict_names=self.restrict_names_var.get(),
             browser=self.BROWSERS.get(self.browser_var.get(), ""),
             concurrent_fragments=fragments,
+            cookiefile=self.cookiefile_var.get() or None,
         )
 
     def start_download(self) -> None:
@@ -448,7 +614,75 @@ class YtDlpGui(tk.Tk):
             self.cancel_button.configure(state="disabled")
 
     def _ffmpeg_available(self) -> bool:
-        return bool(shutil.which("ffmpeg") or shutil.which("ffmpeg.exe"))
+        path = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        if not path:
+            return False
+
+        try:
+            if sys.platform.startswith("win"):
+                # Evitar janela de erro do Windows ao executar um ffmpeg corrompido.
+                SEM_FAILCRITICALERRORS = 0x0001
+                SEM_NOGPFAULTERRORBOX = 0x0002
+                old_error_mode = ctypes.windll.kernel32.SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)
+                try:
+                    subprocess.run(
+                        [path, "-version"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True,
+                        timeout=5,
+                    )
+                finally:
+                    ctypes.windll.kernel32.SetErrorMode(old_error_mode)
+            else:
+                subprocess.run(
+                    [path, "-version"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                    timeout=5,
+                )
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _update_ffmpeg_status(self) -> None:
+        # Run the potentially-blocking ffmpeg check in a background thread
+        if getattr(self, "ffmpeg_check_running", False):
+            # Already running; schedule next check later
+            try:
+                self.after(5000, self._update_ffmpeg_status)
+            except Exception:
+                pass
+            return
+
+        def _worker() -> None:
+            try:
+                available = self._ffmpeg_available()
+                # update UI in main thread
+                try:
+                    self.after(0, lambda: self._apply_ffmpeg_status(available))
+                except Exception:
+                    pass
+            finally:
+                self.ffmpeg_check_running = False
+
+        self.ffmpeg_check_running = True
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        # note: do not reschedule here — run check only once at startup
+
+    def _apply_ffmpeg_status(self, available: bool) -> None:
+        try:
+            if available:
+                self.ffmpeg_status_label.config(text="Instalado", bg="#2e7d32")
+            else:
+                self.ffmpeg_status_label.config(text="Ausente", bg="#b71c1c")
+        except Exception:
+            try:
+                self.ffmpeg_status_label.config(text="Erro", bg="gray")
+            except Exception:
+                pass
 
     def _build_options(self, settings: DownloadSettings) -> dict[str, Any]:
         playlist_template = (
@@ -475,6 +709,8 @@ class YtDlpGui(tk.Tk):
             "extractor_retries": 3,
         }
 
+        ffmpeg_available = self._ffmpeg_available()
+
         if settings.media_type == "Somente áudio":
             options["format"] = "bestaudio/best"
             options["postprocessors"] = [
@@ -485,22 +721,38 @@ class YtDlpGui(tk.Tk):
                 }
             ]
         else:
-            options["format"] = self.QUALITY_MAP.get(
-                settings.video_quality,
-                self.QUALITY_MAP["Até 1080p"],
-            )
-            options["merge_output_format"] = "mp4"
+            if ffmpeg_available:
+                options["format"] = self.QUALITY_MAP.get(
+                    settings.video_quality,
+                    self.QUALITY_MAP["Até 1080p"],
+                )
+                options["merge_output_format"] = "mp4"
+            else:
+                fallback_quality = {
+                    "Melhor disponível": "best",
+                    "Até 2160p (4K)": "best[height<=2160]",
+                    "Até 1440p": "best[height<=1440]",
+                    "Até 1080p": "best[height<=1080]",
+                    "Até 720p": "best[height<=720]",
+                    "Até 480p": "best[height<=480]",
+                    "Até 360p": "best[height<=360]",
+                }
+                options["format"] = fallback_quality.get(
+                    settings.video_quality,
+                    "best",
+                )
 
         postprocessors = options.setdefault("postprocessors", [])
 
-        if settings.metadata:
+        if settings.metadata and ffmpeg_available:
             postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
             options["embed_metadata"] = True
 
         if settings.thumbnail:
             options["writethumbnail"] = True
             # Compatibilidade visual em arquivos de áudio e vídeo.
-            postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
+            if ffmpeg_available:
+                postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
 
         if settings.subtitles:
             options.update(
@@ -509,12 +761,39 @@ class YtDlpGui(tk.Tk):
                     "writeautomaticsub": True,
                     "subtitleslangs": ["pt-BR", "pt", "en"],
                     "subtitlesformat": "best",
-                    "embedsubtitles": settings.media_type == "Vídeo",
+                    "embedsubtitles": settings.media_type == "Vídeo" and ffmpeg_available,
                 }
             )
 
         if settings.browser:
-            options["cookiesfrombrowser"] = (settings.browser,)
+            # If user provided a cookie file explicitly, prefer that
+            if settings.cookiefile:
+                options["cookiefile"] = settings.cookiefile
+            else:
+                # Try to copy browser cookie DB to a temporary file first (mitigates locked DB copy errors)
+                try_path = None
+                try:
+                    try_path = self._find_chrome_like_cookie_file(settings.browser)
+                except Exception:
+                    try_path = None
+
+                copied = None
+                if try_path:
+                    copied = self._copy_sqlite_db_with_backup(try_path)
+
+                if copied:
+                    options["cookiefile"] = copied
+                    # remember to clean up after download
+                    self._temp_cookiefile = copied
+                    self.event_queue.put(("log", f"Usando cópia temporária do cookie: {copied}"))
+                else:
+                    options["cookiesfrombrowser"] = (settings.browser,)
+
+        # Debug info to help diagnose format/ffmpeg issues
+        try:
+            self.event_queue.put(("log", f"DEBUG: ffmpeg_available={ffmpeg_available}, format={options.get('format')}"))
+        except Exception:
+            pass
 
         return options
 
@@ -536,7 +815,33 @@ class YtDlpGui(tk.Tk):
             if self.cancel_event.is_set():
                 self.event_queue.put(("cancelled", None))
             else:
-                self.event_queue.put(("error", str(exc)))
+                msg = str(exc)
+                lower = msg.lower()
+                # Detect common yt-dlp cookie DB copy failure (Edge/Chrome)
+                if ("could not copy" in lower and "cookie" in lower) or "could not not copy chrome cookie database" in lower:
+                    friendly = (
+                        "Falha ao acessar o banco de cookies do navegador.\n\n"
+                        "Feche o navegador (Edge/Chrome/Chromium) e tente novamente,\n"
+                        "ou clique em 'Selecionar' e aponte para o arquivo de cookies manualmente.\n\n"
+                        "Mais informações: https://github.com/yt-dlp/yt-dlp/issues/7271"
+                    )
+                    self.event_queue.put(("error", friendly))
+                else:
+                    self.event_queue.put(("error", msg))
+        finally:
+            # cleanup temporary cookie DB if we created one
+            try:
+                tmp = getattr(self, "_temp_cookiefile", None)
+                if tmp:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                            self.event_queue.put(("log", f"Arquivo de cookie temporário removido: {tmp}"))
+                    except Exception:
+                        pass
+                    self._temp_cookiefile = None
+            except Exception:
+                pass
 
     def _progress_hook(self, data: dict[str, Any]) -> None:
         if self.cancel_event.is_set():

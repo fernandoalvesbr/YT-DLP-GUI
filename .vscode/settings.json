@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd \"c:\\\\Users\\\\ferna\\\\OneDrive\\\\Documentos\\\\meus projetos\\\\YT-DLP-GUI\" ; if \\(Test-Path \\.\\\\dist\\\\yt_dlp_gui\\.exe\\) \\{ Write-Output 'FOUND' \\} else \\{ Write-Output 'MISSING' \\} ; Get-ChildItem \\.\\\\dist \\| Select-Object Name, Length$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
