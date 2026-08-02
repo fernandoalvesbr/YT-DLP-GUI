@@ -334,12 +334,18 @@ class YtDlpGui(tk.Tk):
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
-        footer = ttk.Label(
-            main,
-            text="Baixe apenas conteúdo que você tem autorização para acessar e salvar.",
-            anchor="center",
-        )
+        footer = ttk.Frame(main)
         footer.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            footer,
+            text="Baixe apenas conteúdo que você tem autorização para acessar e salvar.",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            footer,
+            text="Programado por Peixe (fernandoalvesbr)",
+        ).grid(row=0, column=1, sticky="e", padx=(16, 0))
 
     def _show_missing_dependency(self) -> None:
         messagebox.showerror(
