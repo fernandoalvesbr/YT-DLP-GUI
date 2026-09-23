@@ -7,9 +7,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import sqlite3
-import tempfile
-import time
 import tkinter as tk
 import webbrowser
 from dataclasses import dataclass
@@ -24,7 +21,7 @@ except ImportError:
     yt_dlp = None
 
 APP_NAME = "YT-DLP GUI"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 PROJECT_URL = "https://github.com/yt-dlp/yt-dlp"
 
 
@@ -142,8 +139,6 @@ class YtDlpGui(tk.Tk):
         self.eta_var = tk.StringVar(value="")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.cookiefile_var = tk.StringVar(value="")
-        # temporary cookiefile created when copying browser DB
-        self._temp_cookiefile: str | None = None
         # Flag to avoid overlapping FFmpeg checks
         self.ffmpeg_check_running = False
 
@@ -236,7 +231,7 @@ class YtDlpGui(tk.Tk):
         ttk.Button(cookie_frame, text="Selecionar", command=self.choose_cookie_file).pack(side="left", padx=(6,0))
 
         options = ttk.Frame(settings)
-        options.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(13, 0))
+        options.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(13, 0))
         for column in range(4):
             options.columnconfigure(column, weight=1)
 
@@ -269,10 +264,14 @@ class YtDlpGui(tk.Tk):
 
         # FFmpeg status indicator (will be updated periodically)
         ffmpeg_frame = ttk.Frame(settings)
-        ffmpeg_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ffmpeg_frame.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Label(ffmpeg_frame, text="FFmpeg:").pack(side="left", padx=(0, 6))
         self.ffmpeg_status_label = tk.Label(ffmpeg_frame, text="Verificando...", bg="gray", fg="white", padx=8)
         self.ffmpeg_status_label.pack(side="left")
+        engine_version = yt_dlp.version.__version__ if yt_dlp else "não instalado"
+        ttk.Label(ffmpeg_frame, text=f"yt-dlp: {engine_version}").pack(side="left", padx=12)
+        runtime = "Deno" if shutil.which("deno") else "Node" if shutil.which("node") else "ausente (instale Deno)"
+        ttk.Label(ffmpeg_frame, text=f"JavaScript: {runtime}").pack(side="left")
 
         controls = ttk.Frame(main)
         controls.grid(row=3, column=0, sticky="ew", pady=(0, 10))
@@ -351,7 +350,7 @@ class YtDlpGui(tk.Tk):
         messagebox.showerror(
             "Dependência ausente",
             "O módulo yt-dlp não foi encontrado.\n\n"
-            "Instale com:\npython -m pip install -U yt-dlp",
+            "Instale com:\npython -m pip install -U yt-dlp[default]",
         )
         self._append_log("Dependência ausente: instale yt-dlp com pip.")
 
@@ -388,143 +387,12 @@ class YtDlpGui(tk.Tk):
 
     def choose_cookie_file(self) -> None:
         selected = filedialog.askopenfilename(
-            title="Selecione o arquivo SQLite de cookies (ex.: Cookies)",
-            filetypes=(("SQLite files", "*.sqlite;*.db;*"), ("All files", "*.*")),
+            title="Selecione cookies.txt no formato Netscape",
+            filetypes=(("Cookies Netscape", "*.txt"), ("Todos os arquivos", "*.*")),
             initialdir=str(Path.home()),
         )
         if selected:
             self.cookiefile_var.set(selected)
-
-    def _find_chrome_like_cookie_file(self, browser: str) -> str | None:
-        # Search common locations for Chrome/Edge-like cookie DBs
-        local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-        if not local:
-            return None
-        candidates = []
-        # Map browser key to base folder names
-        mapping = {
-            "chrome": os.path.join(local, "Google", "Chrome", "User Data"),
-            "edge": os.path.join(local, "Microsoft", "Edge", "User Data"),
-            "chromium": os.path.join(local, "Chromium", "User Data"),
-            "brave": os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data"),
-            "vivaldi": os.path.join(local, "Vivaldi", "User Data"),
-        }
-        base = mapping.get(browser)
-        if base and os.path.isdir(base):
-            # check Default and common profiles
-            for profile in ("Default", "Profile 1", "Profile 2"):
-                p = os.path.join(base, profile, "Cookies")
-                if os.path.isfile(p):
-                    candidates.append(p)
-            # also check any directory under base
-            try:
-                for name in os.listdir(base):
-                    p = os.path.join(base, name, "Cookies")
-                    if os.path.isfile(p):
-                        candidates.append(p)
-            except Exception:
-                pass
-
-        return candidates[0] if candidates else None
-
-    def _copy_sqlite_db_with_backup(self, src: str) -> str | None:
-        # Try to create a consistent copy using sqlite3 backup API; fallback to shutil.copy2
-        try:
-            if not os.path.isfile(src):
-                return None
-            dest = tempfile.NamedTemporaryFile(prefix="yt_dlp_cookies_", delete=False).name
-            try:
-                # open destination DB
-                dest_conn = sqlite3.connect(dest)
-                try:
-                    # try to open src in read-only URI mode
-                    src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-                except sqlite3.OperationalError:
-                    dest_conn.close()
-                    # fallback to raw copy
-                    shutil.copy2(src, dest)
-                    return dest
-                try:
-                    with src_conn:
-                        src_conn.backup(dest_conn)
-                    return dest
-                finally:
-                    try:
-                        src_conn.close()
-                    except Exception:
-                        pass
-                    try:
-                        dest_conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                # fallback to copy
-                try:
-                    shutil.copy2(src, dest)
-                    return dest
-                except Exception:
-                    try:
-                        if os.path.exists(dest):
-                            os.remove(dest)
-                    except Exception:
-                        pass
-                    return None
-        except Exception:
-            return None
-
-    def _on_detect_cookies(self) -> None:
-        # Run detection in background to avoid UI freeze
-        def _job():
-            path = self._find_opera_cookie_file()
-            if path:
-                try:
-                    self.after(0, lambda: self.cookiefile_var.set(path))
-                    self.event_queue.put(("log", f"Detectado cookie do Opera: {path}"))
-                except Exception:
-                    pass
-            else:
-                self.event_queue.put(("log", "Não foi possível detectar automaticamente o arquivo de cookies do Opera."))
-
-        threading.Thread(target=_job, daemon=True).start()
-
-    def _find_opera_cookie_file(self) -> str | None:
-        # Common Opera profile locations to check
-        candidates: list[str] = []
-        appdata = os.environ.get("APPDATA")
-        localappdata = os.environ.get("LOCALAPPDATA")
-        def check_base(base: str) -> None:
-            try:
-                if not base or not os.path.isdir(base):
-                    return
-                for name in os.listdir(base):
-                    possible = os.path.join(base, name, "Cookies")
-                    if os.path.isfile(possible):
-                        candidates.append(possible)
-            except Exception:
-                pass
-
-        # Typical Opera roaming profile
-        if appdata:
-            check_base(os.path.join(appdata, "Opera Software"))
-        # Also check LOCALAPPDATA
-        if localappdata:
-            check_base(os.path.join(localappdata, "Opera Software"))
-
-        # As a fallback, search a few known subpaths
-        known_paths = [
-            os.path.join(appdata or "", "Opera Software", "Opera Stable", "Cookies"),
-            os.path.join(appdata or "", "Opera Software", "Opera GX Stable", "Cookies"),
-            os.path.join(appdata or "", "Opera Software", "Opera Air Stable", "Cookies"),
-            # also check localappdata variants
-            os.path.join(localappdata or "", "Opera Software", "Opera Stable", "Cookies"),
-            os.path.join(localappdata or "", "Opera Software", "Opera GX Stable", "Cookies"),
-            os.path.join(localappdata or "", "Opera Software", "Opera Air Stable", "Cookies"),
-        ]
-        for p in known_paths:
-            if p and os.path.isfile(p):
-                candidates.insert(0, p)
-
-        return candidates[0] if candidates else None
 
     def clear_log(self) -> None:
         self.log_text.configure(state="normal")
@@ -637,6 +505,7 @@ class YtDlpGui(tk.Tk):
                         stderr=subprocess.DEVNULL,
                         check=True,
                         timeout=5,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                 finally:
                     ctypes.windll.kernel32.SetErrorMode(old_error_mode)
@@ -771,29 +640,13 @@ class YtDlpGui(tk.Tk):
                 }
             )
 
-        if settings.browser:
-            # If user provided a cookie file explicitly, prefer that
-            if settings.cookiefile:
-                options["cookiefile"] = settings.cookiefile
-            else:
-                # Try to copy browser cookie DB to a temporary file first (mitigates locked DB copy errors)
-                try_path = None
-                try:
-                    try_path = self._find_chrome_like_cookie_file(settings.browser)
-                except Exception:
-                    try_path = None
+        if settings.cookiefile:
+            options["cookiefile"] = settings.cookiefile
+        elif settings.browser:
+            options["cookiesfrombrowser"] = (settings.browser,)
 
-                copied = None
-                if try_path:
-                    copied = self._copy_sqlite_db_with_backup(try_path)
-
-                if copied:
-                    options["cookiefile"] = copied
-                    # remember to clean up after download
-                    self._temp_cookiefile = copied
-                    self.event_queue.put(("log", f"Usando cópia temporária do cookie: {copied}"))
-                else:
-                    options["cookiesfrombrowser"] = (settings.browser,)
+        # Deno is preferred; enable Node as an alternative when installed.
+        options["js_runtimes"] = {"deno": {}, "node": {}}
 
         # Debug info to help diagnose format/ffmpeg issues
         try:
@@ -828,26 +681,12 @@ class YtDlpGui(tk.Tk):
                     friendly = (
                         "Falha ao acessar o banco de cookies do navegador.\n\n"
                         "Feche o navegador (Edge/Chrome/Chromium) e tente novamente,\n"
-                        "ou clique em 'Selecionar' e aponte para o arquivo de cookies manualmente.\n\n"
+                        "ou clique em 'Selecionar' e escolha um cookies.txt exportado no formato Netscape.\n\n"
                         "Mais informações: https://github.com/yt-dlp/yt-dlp/issues/7271"
                     )
                     self.event_queue.put(("error", friendly))
                 else:
                     self.event_queue.put(("error", msg))
-        finally:
-            # cleanup temporary cookie DB if we created one
-            try:
-                tmp = getattr(self, "_temp_cookiefile", None)
-                if tmp:
-                    try:
-                        if os.path.exists(tmp):
-                            os.remove(tmp)
-                            self.event_queue.put(("log", f"Arquivo de cookie temporário removido: {tmp}"))
-                    except Exception:
-                        pass
-                    self._temp_cookiefile = None
-            except Exception:
-                pass
 
     def _progress_hook(self, data: dict[str, Any]) -> None:
         if self.cancel_event.is_set():
