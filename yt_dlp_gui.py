@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from typing import Any
 
 try:
     import yt_dlp
-    from yt_dlp.utils import DownloadCancelled
+    from yt_dlp.utils import DownloadCancelled, download_range_func
 except ImportError:
     yt_dlp = None
 
@@ -40,6 +41,8 @@ class DownloadSettings:
     browser: str
     concurrent_fragments: int
     cookiefile: str | None
+    start_time: int | None = None
+    end_time: int | None = None
 
 
 class GuiLogger:
@@ -139,6 +142,9 @@ class YtDlpGui(tk.Tk):
         self.eta_var = tk.StringVar(value="")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.cookiefile_var = tk.StringVar(value="")
+        self.clip_var = tk.BooleanVar(value=False)
+        self.start_time_var = tk.StringVar(value="00:00")
+        self.end_time_var = tk.StringVar(value="01:00")
         # Flag to avoid overlapping FFmpeg checks
         self.ffmpeg_check_running = False
 
@@ -262,9 +268,26 @@ class YtDlpGui(tk.Tk):
             width=5,
         ).pack(side="left", padx=(6, 0))
 
+        clip_frame = ttk.Frame(settings)
+        clip_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(
+            clip_frame, text="Baixar apenas um trecho", variable=self.clip_var,
+            command=self._update_clip_controls,
+        ).pack(side="left")
+        ttk.Label(clip_frame, text="De:").pack(side="left", padx=(12, 4))
+        self.start_time_entry = ttk.Entry(clip_frame, textvariable=self.start_time_var, width=10, state="disabled")
+        self.start_time_entry.pack(side="left")
+        ttk.Label(clip_frame, text="Até:").pack(side="left", padx=(12, 4))
+        self.end_time_entry = ttk.Entry(clip_frame, textvariable=self.end_time_var, width=10, state="disabled")
+        self.end_time_entry.pack(side="left")
+        ttk.Label(clip_frame, text="segundos, MM:SS ou HH:MM:SS").pack(side="left", padx=12)
+        ttk.Label(settings, text="Trechos exigem FFmpeg; o corte preciso pode demorar.").grid(
+            row=6, column=0, columnspan=4, sticky="w", pady=(4, 0)
+        )
+
         # FFmpeg status indicator (will be updated periodically)
         ffmpeg_frame = ttk.Frame(settings)
-        ffmpeg_frame.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ffmpeg_frame.grid(row=7, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Label(ffmpeg_frame, text="FFmpeg:").pack(side="left", padx=(0, 6))
         self.ffmpeg_status_label = tk.Label(ffmpeg_frame, text="Verificando...", bg="gray", fg="white", padx=8)
         self.ffmpeg_status_label.pack(side="left")
@@ -407,12 +430,41 @@ class YtDlpGui(tk.Tk):
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _update_clip_controls(self) -> None:
+        state = "normal" if self.clip_var.get() else "disabled"
+        self.start_time_entry.configure(state=state)
+        self.end_time_entry.configure(state=state)
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> int:
+        value = value.strip()
+        if not re.fullmatch(r"[0-9]+(?::[0-9]{1,2}){0,2}", value):
+            raise ValueError("Use segundos inteiros, MM:SS ou HH:MM:SS.")
+        parts = [int(part) for part in value.split(":")]
+        if any(part >= 60 for part in parts[1:]):
+            raise ValueError("Os campos após ':' devem estar entre 00 e 59.")
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + part
+        return seconds
+
     def _collect_settings(self) -> DownloadSettings | None:
         url = self.url_var.get().strip()
         if not url:
             messagebox.showwarning("URL necessária", "Cole o endereço do vídeo ou da playlist.")
             self.url_entry.focus_set()
             return None
+
+        start_time = end_time = None
+        if self.clip_var.get():
+            try:
+                start_time = self._parse_timestamp(self.start_time_var.get())
+                end_time = self._parse_timestamp(self.end_time_var.get())
+                if end_time <= start_time:
+                    raise ValueError("O fim do trecho deve ser maior que o início.")
+            except ValueError as exc:
+                messagebox.showerror("Trecho inválido", str(exc))
+                return None
 
         output_dir = Path(self.output_var.get()).expanduser()
         try:
@@ -440,6 +492,8 @@ class YtDlpGui(tk.Tk):
             browser=self.BROWSERS.get(self.browser_var.get(), ""),
             concurrent_fragments=fragments,
             cookiefile=self.cookiefile_var.get() or None,
+            start_time=start_time,
+            end_time=end_time,
         )
 
     def start_download(self) -> None:
@@ -451,6 +505,10 @@ class YtDlpGui(tk.Tk):
 
         settings = self._collect_settings()
         if settings is None:
+            return
+
+        if settings.start_time is not None and not self._ffmpeg_available():
+            messagebox.showerror("FFmpeg necessário", "Instale o FFmpeg para baixar apenas um trecho.")
             return
 
         if settings.media_type == "Somente áudio" and not self._ffmpeg_available():
@@ -472,6 +530,8 @@ class YtDlpGui(tk.Tk):
         self.download_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self._append_log(f"Iniciando: {settings.url}")
+        if settings.start_time is not None:
+            self._append_log(f"Trecho: {settings.start_time}s até {settings.end_time}s. Aplicado a cada vídeo selecionado.")
 
         self.download_thread = threading.Thread(
             target=self._download_worker,
@@ -564,6 +624,10 @@ class YtDlpGui(tk.Tk):
             "%(playlist_title|Playlist)s/%(playlist_index)03d - %(title)s [%(id)s].%(ext)s"
         )
         single_template = "%(title)s [%(id)s].%(ext)s"
+        if settings.start_time is not None:
+            suffix = f" [{settings.start_time}s-{settings.end_time}s].%(ext)s"
+            playlist_template = playlist_template.replace(".%(ext)s", suffix)
+            single_template = single_template.replace(".%(ext)s", suffix)
         outtmpl = str(settings.output_dir / (playlist_template if settings.playlist else single_template))
 
         options: dict[str, Any] = {
@@ -585,6 +649,13 @@ class YtDlpGui(tk.Tk):
         }
 
         ffmpeg_available = self._ffmpeg_available()
+        if settings.start_time is not None:
+            if settings.end_time is None or not 0 <= settings.start_time < settings.end_time:
+                raise ValueError("Intervalo de tempo inválido.")
+            if not ffmpeg_available:
+                raise ValueError("Instale o FFmpeg para baixar apenas um trecho.")
+            options["download_ranges"] = download_range_func([], [(settings.start_time, settings.end_time)])
+            options["force_keyframes_at_cuts"] = True
 
         if settings.media_type == "Somente áudio":
             options["format"] = "bestaudio/best"
